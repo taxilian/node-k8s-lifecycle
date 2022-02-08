@@ -1,10 +1,12 @@
 {
   "name": "k8s-lifecycle",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A tool to assist with correctly implementing kuberentes startup, health, and readiness checks",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "prepublish": "tsc -p ."
