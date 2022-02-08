@@ -99,7 +99,7 @@ export function getProbeRouter(urls: Partial<typeof HealthCheckURLs> = {}, Route
   }
   
   probeRouter.get(HealthCheckURLs.ready, async (req, res) => {
-    console.log("READY check:", failCase, shutdownRequested);
+    // console.log("READY check:", failCase, shutdownRequested);
       try {
           if (failCase || shutdownRequested) {
               // As soon as shutdown is requested, start returning invalid for the readiness;
