@@ -1,9 +1,15 @@
 import express = require("express");
 import ServerTracker, { WebServer } from './serverTracker';
 
-const ReadinessProbeInterval = process.env.READYPROBE_INTERVAL ? parseInt(process.env.READYPROBE_INTERVAL, 10) : 30; // seconds
-const ClosingTimeout = process.env.SHUTDOWN_TIMEOUT ? parseInt(process.env.SHUTDOWN_TIMEOUT, 10) : 540; // seconds
+export const ReadinessProbeInterval = process.env.READYPROBE_INTERVAL ? parseInt(process.env.READYPROBE_INTERVAL, 10) : 30; // seconds
+export const ClosingTimeout = process.env.SHUTDOWN_TIMEOUT ? parseInt(process.env.SHUTDOWN_TIMEOUT, 10) : 540; // seconds
+export const ConnectionCheckInterval = 1000; // ms - how often we check for connection closure
+export const ForceExitTimeout = 5000; // ms - how long to wait before force exit after Phase 3
 const isDev = process.env.NODE_ENV !== 'production';
+
+function keys<T extends Record<string | number | symbol, unknown>>(obj: T): (keyof T)[] {
+    return Object.keys(obj || {}) as (keyof T)[];
+}
 
 let shutdownRequested = false;
 let shutdownWatchTimeout: NodeJS.Timeout | undefined;
@@ -38,7 +44,7 @@ const HealthCheckURLs = {
   live: '/api/probe/live',
 };
 
-export type isReadyCheck = (...args: any[]) => Promise<boolean>;
+export type isReadyCheck = (...args: unknown[]) => Promise<boolean>;
 const readyChecks: isReadyCheck[] = [];
 export function onReadyCheck(fn: isReadyCheck) { readyChecks.push(fn); }
 
@@ -46,7 +52,7 @@ export type stateChangeCb = (state: Phase, prevState: Phase) => void | Promise<v
 const stateChangeCbs: stateChangeCb[] = [];
 export function onStateChange(fn: stateChangeCb) { stateChangeCbs.push(fn); }
 
-export type shutdownCb = () => Promise<any>;
+export type shutdownCb = () => Promise<void | unknown>;
 const shutdownCbs: shutdownCb[] = [];
 export function onShutdown(fn: shutdownCb) { shutdownCbs.push(fn); }
 
@@ -73,17 +79,21 @@ async function updatePhase(newPhase: Phase) {
     const old = phase;
     phase = newPhase;
     const promises = stateChangeCbs.map(cb => cb(phase, old));
-    try {
-        await Promise.all(promises);
-    } catch {}
+    const results = await Promise.allSettled(promises);
+    
+    // Log any errors from state change callbacks
+    results.forEach((result, index) => {
+        if (result.status === 'rejected') {
+            onException(`Error in state change callback ${index}:`, result.reason);
+        }
+    });
 }
 
 const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
 
 export function getProbeRouter(urls: Partial<typeof HealthCheckURLs> = {}, RouterConstructor = express.Router) {
-  for (const k of Object.keys(urls)) {
-    // @ts-ignore: TS can't tell if this is safe, but it is
-    HealthCheckURLs[k] = urls[k];
+  for (const k of keys(urls)) {
+    HealthCheckURLs[k] = urls[k]!;
   }
   const probeRouter = RouterConstructor();
 
@@ -110,8 +120,10 @@ export function getProbeRouter(urls: Partial<typeof HealthCheckURLs> = {}, Route
               // This shouldn't be possible
               return res.status(500).send("Server not ready");
           }
-          const allReadyChecks = await Promise.all(readyChecks.map(fn => fn()));
-          const readyChecksPassed = allReadyChecks.every(Boolean);
+          const allReadyChecks = await Promise.allSettled(readyChecks.map(fn => fn()));
+          const readyChecksPassed = allReadyChecks.every(result => 
+              result.status === 'fulfilled' && result.value === true
+          );
   
           const httpStarted = httpTrackers.every(t => t.isListening);
           if (!readyChecksPassed) {
@@ -159,8 +171,10 @@ async function shutdownConnectionWatch() {
     try {
         const remaining = httpTrackers.reduce((memo, c) => memo + c.connectionCount, 0);
         const active = httpTrackers.reduce((memo, c) => memo + c.activeConnectionCount, 0);
-        const userShutdownChecks = await Promise.all(shutdownCheckCbs.map(cb => cb()));
-        const userChecksFailed = userShutdownChecks.some(c => c === false);
+        const userShutdownChecks = await Promise.allSettled(shutdownCheckCbs.map(cb => cb()));
+        const userChecksFailed = userShutdownChecks.some(result => 
+            result.status === 'rejected' || (result.status === 'fulfilled' && result.value === false)
+        );
         if (!active && !userChecksFailed) {
             console.log("All connections closed!");
             finishShutdown();
@@ -174,7 +188,7 @@ async function shutdownConnectionWatch() {
           throw new Error();
         }
     } catch {
-        shutdownWatchTimeout = setTimeout(shutdownConnectionWatch, 1000).unref();
+        shutdownWatchTimeout = setTimeout(shutdownConnectionWatch, ConnectionCheckInterval).unref();
     }
 }
 
@@ -192,7 +206,7 @@ async function shutdownConnectionWatch() {
 
     // Check every second to see if we're able to shut down -- once all connections
     // are closed we can safely do so
-    shutdownWatchTimeout = setTimeout(shutdownConnectionWatch, 1000).unref();
+    shutdownWatchTimeout = setTimeout(shutdownConnectionWatch, ConnectionCheckInterval).unref();
 
     setTimeout(async () => {
         // If we ever get to this point we're just going to force close everything
@@ -216,13 +230,20 @@ async function finishShutdown() {
             t.forceClose();
         }
         // Run any registered shutdown handlers
-        await Promise.all(shutdownCbs.map(cb => cb()));
+        const shutdownResults = await Promise.allSettled(shutdownCbs.map(cb => cb()));
+        
+        // Log any errors from shutdown callbacks
+        shutdownResults.forEach((result, index) => {
+            if (result.status === 'rejected') {
+                onException(`Error in shutdown callback ${index}:`, result.reason);
+            }
+        });
 
         console.log("Application stopped, as long as all running tasks are stopped");
 
         // At this point it should be shut down within 5 seconds; if it isn't then
         // we just kill it
-        setTimeout(forceShutdown, 5000).unref();
+        setTimeout(forceShutdown, ForceExitTimeout).unref();
     } catch (err) {
         console.warn("Error shutting down: ", err);
         process.exit(1);
@@ -239,7 +260,7 @@ process.on('SIGTERM', function() {
     intCalled = true;
 });
 
-function forceShutdown(code: any) {
+function forceShutdown(code?: number | string | null) {
     console.log("Failed to shut down gracefully, shutting down hard now");
     // If we hit this, dump out what was still keeping the process alive
     process.exit(code);

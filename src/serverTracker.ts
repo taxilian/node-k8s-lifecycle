@@ -28,13 +28,13 @@ export class ServerTracker {
     isShuttingDown = false;
     connections = new Map<ConnID, Socket>();
 
-    heatlhCheckUrls: string[] = [];
+    healthCheckUrls: string[] = [];
 
     constructor(public server: WebServer, opts?: ServerTrackerOptions) {
         server.on('connection', this.onConnection.bind(this));
         server.on('request', this.onRequest.bind(this));
 
-        if (opts?.healthCheckUrls) { this.heatlhCheckUrls = opts.healthCheckUrls; }
+        if (opts?.healthCheckUrls) { this.healthCheckUrls = opts.healthCheckUrls; }
     }
 
     /**
@@ -95,6 +95,9 @@ export class ServerTracker {
     }
 
     onConnection(sock: Socket) {
+        if (!sock) {
+            return null;
+        }
         const c = this.connections;
         // track keepalive connections...
         if (!sock.$$id) {
@@ -111,7 +114,7 @@ export class ServerTracker {
     private isValidCheck(req: http.IncomingMessage) {
         const {url} = req;
 
-        return this.heatlhCheckUrls.includes(url as string);
+        return this.healthCheckUrls.includes(url as string);
     }
 
     onRequest(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -123,6 +126,7 @@ export class ServerTracker {
 
         sock.$$isCheck = this.isValidCheck(req);
         if (this.isShuttingDown && !sock.$$isCheck) {
+            res.setHeader('Connection', 'close');
             res.writeHead(503, 'Closing');
             res.end('Closing', () => {
                 sock.destroy();

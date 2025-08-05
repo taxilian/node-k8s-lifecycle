@@ -1,197 +1,317 @@
+# k8s-lifecycle
 
-Kubernetes Lifecycle Events
-===========================
+A TypeScript/Node.js library that helps implement Kubernetes lifecycle management correctly, ensuring graceful shutdowns and proper health check handling for seamless deployments, scaling, and restarts.
 
-Kubernetes lifecycle events seem very simple at first, but if you want to be able to do seemless
-updates, scaling, restarts, etc then it is more complicated than it seems at first. There are three
-lifecycle events:
+## Installation
 
-* Startup check
-* Readiness check
-* Liveness check
+```bash
+npm install k8s-lifecycle
+```
 
-Most of the time the startup check isn't really needed; it's basically a way to e.g. wait longer for
-the check to first succeed (e.g. wait for long startup times on the app) before moving to a shorter
-time.
+Note: This library requires Express as a peer dependency (version 3.0.0 or higher).
 
+## Why Use This Library?
 
-The goal
---------
+Kubernetes lifecycle events appear simple at first, but implementing them correctly is crucial for zero-downtime deployments. This library handles the complexity of:
 
-Here is what *should* happen when you shut down a kubernetes pod:
+- **Graceful shutdowns** that prevent dropped connections
+- **Proper health check timing** to ensure traffic stops before your app does
+- **Connection tracking** to wait for active requests to complete
+- **Automatic signal handling** for Kubernetes termination
 
-1. When shutdown is requested the Readiness endpoint should *immediately* start responding with a
-   failure; the reason is that once the readiness endpoint fails kubernetes will no longer send
-   traffic to the pod. It is important that this happens *before* the pod actually stops being
-   able to accept traffic, otherwise you may get connections which are refused before k8s stops
-   sending them. We will call this Shutdown Phase 1.
+## Quick Start
 
-2. Once a sufficient amount of time has passed that you are confident that the readiness checks will
-   for sure have been made and failed (this needs to be at least as long as your readiness check
-   interval, but if you're paranoid like I am you'll make it a bit longer) you should stop accepting
-   new connections so that even if something misbehaves we are still getting closer to being able to
-   fully shut down. This is Shutdown Phase 2. We can also close any idle connections at this point.
+```typescript
+import * as K8sLifecycle from 'k8s-lifecycle';
+import express from 'express';
+import http from 'http';
 
-   At this point, if there are no active requests going on then we can move to Phase 3; otherwise
-   we need to wait for all active requests to finish *or* for our maximum timeout to be reached.
+const app = express();
 
-   If you are using websockets you should do something to tell all clients to reconnect at this point;
-   when they do so they should be sent to a different pod, since we already stopped being a viable
-   target when phase 1 started and that should have propagated.
+// Add the probe endpoints to your Express app
+const probeRouter = K8sLifecycle.getProbeRouter({
+  test: '/api/probe/test',   // Optional test endpoint
+  ready: '/api/probe/ready',  // Readiness probe endpoint
+  live: '/api/probe/live',    // Liveness probe endpoint
+});
 
-      One little wrinkle here, btw, is that even though we want to mostly stop listening for new
-      requests we still need to respond to the liveness check so that kubernetes doesn't kill the
-      pod while it's shutting down, so our web server needs to conditionally allow new requests if they
-      are for liveness or readiness, but not count that as an active connection and wait to shut down
-      because of it.
+app.use(probeRouter);
 
-3. After either all connections are closed or else the maximum timeout is reached we can finish
-   shutting down our application -- we call this Phase 3 and this is where you disconnect from
-   database connections, clear any intervals, etc. Finally we will wait a few more seconds and if
-   we are still running then we're just going to kill the app because it's probably got something
-   keeping us open.
+// Create your server and register it with k8s-lifecycle
+const server = http.createServer(app);
+K8sLifecycle.add(server);
 
-Challenges with Node.js
------------------------
+// Add custom readiness checks (optional)
+K8sLifecycle.onReadyCheck(async () => {
+  // Return true if your app is ready to receive traffic
+  return isDatabaseConnected && isRedisReady;
+});
 
-Node.js doesn't have an easy way to determine if you have any open or active connections. It also
-doesn't have a good way to close existing idle connections, etc. For that reason we have a helper
-called ServerTracker which helps with all of this.
+// Add cleanup handlers for graceful shutdown
+K8sLifecycle.onShutdown(async () => {
+  await mongoose.disconnect();
+  await redisClient.quit();
+  clearInterval(backgroundJobInterval);
+});
 
-Another frustrating issue is that there are a lot of things that will keep your node process from exiting:
+server.listen(3000);
+```
 
-* Open network connections
-* Open files
-* Unresolved setTimeout, setInterval, etc
+## How It Works
 
-One trick to avoid this is to call `.unref()` on the result of a setTimeout or setInterval that you
-don't want to keep the process open, like so:
+### The Three Lifecycle Probes
 
-    setTimeout(() => doSomethingAmazing(), 15000).unref();
+1. **Startup Probe** - Allows longer startup times before switching to liveness checks
+2. **Readiness Probe** - Determines if your pod should receive traffic
+3. **Liveness Probe** - Determines if your pod is healthy and should keep running
 
-or
+### Graceful Shutdown Process
 
-    const intvlId = setInterval(incrediblyAwesomeCallback, 5000);
-    intvlId.unref();
+When Kubernetes wants to terminate your pod, this library orchestrates a three-phase shutdown:
 
-Using this library
-------------------
+#### Phase 1: Stop Accepting Traffic (`shutdownReq`)
+- Readiness endpoint immediately starts returning failures
+- Kubernetes stops sending new traffic to your pod
+- Existing connections continue to work
+- Duration: 1.5 × readiness check interval (configurable)
 
-I've tried to balance ease of use with flexibility; we'll see how much it evolves if others use it =]
+#### Phase 2: Drain Connections (`shuttingDown`)
+- Server stops accepting new connections
+- Existing requests are allowed to complete
+- Idle connections are closed
+- New non-health-check requests receive 503 status with `Connection: close` header
+- Websocket clients should be notified to reconnect
+- Health check endpoints continue to respond
 
-    import * as K8sLifecycle from 'k8s-lifecycle';
+#### Phase 3: Final Cleanup (`final`)
+- All connections have been closed or timeout reached
+- Database connections are closed
+- Background jobs are cancelled
+- Process exits cleanly
 
-    // Somewhere in your express app config
+### Robust Error Handling
 
-    // These are defaults, you only need to provide them if you want to override one or more
-    // You can set `test` to empty string (`''`) if you don't want the API defined
-    const probeRouter = K8sLifecycle.getProbeRouter({
-      test: '/api/probe/test',
-      ready: '/api/probe/ready',
-      live: '/api/probe/live',
-    });
+The library uses `Promise.allSettled` for all callback arrays, ensuring that:
+- One failing callback doesn't prevent others from running
+- All shutdown handlers execute even if some throw errors
+- Errors are logged but don't stop the shutdown process
 
-    // Note that you need the APIs above to be the full path, rather than providing it here,
-    // because k8s-lifecycle needs to know the full path of your APIs in order to allow those
-    // requests through when the server is in shutdown mode
-    app.use(probeRouter);
+## API Reference
 
-    // After you create your HTTP server
-    K8sLifecycle.add(server);
+### Core Functions
 
+#### `getProbeRouter(urls?, RouterConstructor?)`
+Creates an Express router with health check endpoints.
 
-Adding custom hooks and events
-------------------------------
+```typescript
+const probeRouter = K8sLifecycle.getProbeRouter({
+  test: '/api/probe/test',   // Optional, defaults provided
+  ready: '/api/probe/ready',
+  live: '/api/probe/live',
+});
+```
 
-There are several customization points:
+#### `add(server)`
+Registers an HTTP/HTTPS server for lifecycle management.
 
-1. Custom ready checks
-   
-   These should return a promise and will be called to determine if the pod is ready for traffic.
-   Since health checks are called frequently you want these to be really cheap to run -- e.g. if
-   you want to check your database connection it's better to have that happen in a setInterval or
-   similar and then have this check report the results.
+```typescript
+K8sLifecycle.add(server);
+```
 
-      K8sLifecycle.onReadyCheck(async () => {
-        if (dbIsWorking) return true;
-        else return false;
-      });
+#### `onReadyCheck(fn)`
+Adds a custom readiness check. Return `true` if ready, `false` if not.
 
-   Examples of what should go in here include checks on your database, session store, perhaps
-   network connection, etc. These are things which tell us that no traffic should be sent to the
-   pod but the pod may still recover, so don't kill it.
+```typescript
+K8sLifecycle.onReadyCheck(async () => {
+  return await checkDatabaseConnection();
+});
+```
 
-2. Shutdown ready check
-   
-   This is called to determine if the app is ready to shut down; without this the app will finish
-   shutting down "early" if there are no active http connections, this lets you check extra things
+#### `onShutdown(fn)`
+Adds a cleanup handler for graceful shutdown. This is called when a shutdown has been requested, but the process won't exist until all shutdown readiness checks have passed.
 
-       K8sLifecycle.addShutdownReadyCheck(async () => {
-         return hasAllMyAwesomeCrapStoppedAlready;
-       });
+```typescript
+K8sLifecycle.onShutdown(async () => {
+  await closeAllConnections();
+});
+```
 
-3. Final shutdown callback
+#### `addShutdownReadyCheck(fn)`
+Adds a check to determine if the app is ready to complete shutdown. When a shutdown is requested all onShutdown handlers are called, but if there are things that take time to shut down this function can be used to let it know when it's safe to exit.
 
-   This hook is called when we get to Stage 3 and are about to shut everything down; this is where
-   you want to close your database connections, cancel timeouts or intervals, etc. Each callback
-   can return a promise and it will not finish until all are complete.
+```typescript
+K8sLifecycle.addShutdownReadyCheck(async () => {
+  return pendingJobs.length === 0;
+});
+```
 
-       K8sLifecycle.onShutdown(async () => {
-         mongoose.disconnect();
-         agenda.close();
-         clearInterval(watchDogIntvlId);
-       });
+#### `onStateChange(fn)`
+Monitors lifecycle state transitions.
 
-4. State changed callback
+```typescript
+K8sLifecycle.onStateChange((newState, oldState) => {
+  logger.info(`Lifecycle state changed: ${oldState} → ${newState}`);
+});
+```
 
-   Any time our state changes this will be called. There are 5 phases (see below) so this just allows
-   you to get notified on those changes.
+Available states (exported as `Phase` enum):
+- `starting` - Initial startup
+- `run` - Normal operation
+- `shutdownReq` - Phase 1 shutdown
+- `shuttingDown` - Phase 2 shutdown
+- `final` - Phase 3 shutdown
 
-       K8sLifecycle.onStateChange((newState, oldState) => {
-         console.log(`Moving from ${oldState} to ${newState}`);
-       });
+```typescript
+import { Phase } from 'k8s-lifecycle';
 
-   The states come from an enum, which is exported as `Phase`:
+K8sLifecycle.onStateChange((newState, oldState) => {
+  if (newState === Phase.Phase2) {
+    // Handle phase 2 specific logic
+  }
+});
+```
 
-       export enum Phase {
-          Startup = 'starting',
-          Running = 'run',
-          Phase1 = 'shutdownReq',
-          Phase2 = 'shuttingDown',
-          Phase3 = 'final',
-       };
+#### `setUnrecoverableError(error)`
+Marks the application as unhealthy, causing liveness checks to fail. Any time something happens that you can't recover from, use this. Good examples include the inability to connect to a database or a critical service, errors that leave the application in an inconsistent state, or anything else that means the application will not work without being restarted.
 
-5. Set an unrecoverable error
+```typescript
+K8sLifecycle.setUnrecoverableError(new Error("Lost database connection"));
+```
 
-   When called this will flag an unrecoverable error and the liveness check will start failing. In dev
-   (if `NODE_ENV !== 'production'`) it will immediately kill the process.
+#### `startShutdown()`
+Manually triggers graceful shutdown (automatically called on SIGTERM).
 
-       K8sLifecycle.setUnrecoverableError(new Error("I am having an existential crisis and my database is gone."));
+#### `setOnException(fn)`
+Sets the error logging handler (defaults to `console.warn`).
 
-Functions
----------
+```typescript
+K8sLifecycle.setOnException((msg, ...args) => {
+  logger.error(msg, ...args);
+});
+```
 
-  * setUnrecoverableError(err: Error) - set an unrecoverable error, makes liveness check fail. cannot be reversed
+## Environment Variables
 
-  * setOnException(fn: (msg, ...args: any[])) - Set the log handler used for errors and stuff. Defaults to `console.warn`
+- `READYPROBE_INTERVAL` - Readiness check interval in seconds (default: 30)
+- `SHUTDOWN_TIMEOUT` - Maximum shutdown duration in seconds (default: 540)
+- `NODE_ENV` - When not "production", unrecoverable errors immediately exit
 
-  * onReadyCheck(fn: () => Promise<boolean>) - Adds a check to used to determine if the app is ready. Return value true - ready, false - not ready
+## Best Practices
 
-  * onShutdown(fn: () => Promise<any>) - Adds a callback to be called on shutdown.
+### 1. Keep Health Checks Lightweight
 
-  * addShutdownReadyCheck(fn: () => Promise<boolean>) - Adds a check to determine if the app is ready to move to shutdown (see above).
+Don't perform expensive operations in readiness checks. Instead, maintain state:
 
-  * addHttpServer(server: http.Server | https.Server) - Adds an http(s) server to be tracked, its lifecycle will be managed. You should add every server used by your app that you want to be able to gracefully shut down.
+```typescript
+let dbHealthy = true;
 
-  * getProbeRouter(urls: Partial<HealthCheckURLs>, RouterConstructor) - Creates a router that can be used by express and provides the health check probes. RouterConstructor defaults to `express.Router` but should work with any constructor that is API compatible.
+// Check periodically in the background
+setInterval(async () => {
+  try {
+    await db.ping();
+    dbHealthy = true;
+  } catch (err) {
+    dbHealthy = false;
+  }
+}, 5000).unref();
 
-  * startShutdown() - Called automatically when a SIGTERM is received, but you can call it yourself to trigger Phase 1 shutdown.
+// Use cached state in readiness check
+K8sLifecycle.onReadyCheck(async () => dbHealthy);
+```
 
-Environment variables
----------------------
+### 2. Handle Long-Running Requests
 
-These environment variables change the behavior:
+Ensure your shutdown timeout accounts for your longest operations:
 
-* `READYPROBE_INTERVAL` - defaults to '30', used to decide how long Phase 1 should last. Phase 1 will last `1.5 * READYPROBE_INTERVAL` seconds.
-* `SHUTDOWN_TIMEOUT` - Deafults to '540' seconds (9 minutes), the app will be killed if it takes longer than this after entering Phase 2 before all connections drop.
-* `NODE_ENV` - If NODE_ENV is not `production` then setUnrecoverableError will kill the app instead of just setting the liveness response.
+```bash
+# For operations that might take up to 5 minutes
+export SHUTDOWN_TIMEOUT=360
+```
+
+### 3. Clean Up Resources
+
+Prevent your Node.js process from hanging:
+
+```typescript
+// Use unref() on timers that shouldn't block shutdown
+const timer = setInterval(backgroundTask, 5000);
+timer.unref();
+
+// Always clean up in shutdown handler
+K8sLifecycle.onShutdown(async () => {
+  clearInterval(timer);
+  await closeAllConnections();
+});
+```
+
+### 4. Configure Kubernetes Properly
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: app
+    livenessProbe:
+      httpGet:
+        path: /api/probe/live
+        port: 3000
+      initialDelaySeconds: 30
+      periodSeconds: 10
+    readinessProbe:
+      httpGet:
+        path: /api/probe/ready
+        port: 3000
+      initialDelaySeconds: 5
+      periodSeconds: 5
+    lifecycle:
+      preStop:
+        exec:
+          command: ["sh", "-c", "sleep 15"]  # Give time for endpoints to update
+```
+
+## Troubleshooting
+
+### Process Won't Exit
+
+Common causes:
+- Open network connections
+- Active timers without `.unref()`
+- Unclosed file handles
+- Database connections not closed in shutdown handler
+
+### Connections Dropped During Deployment
+
+Ensure:
+- Readiness check interval in Kubernetes matches `READYPROBE_INTERVAL`
+- preStop hook gives enough time for readiness checks to propagate
+- Phase 1 duration is sufficient (1.5 × check interval)
+
+### WebSocket Handling
+
+Notify clients to reconnect during Phase 2:
+
+```typescript
+K8sLifecycle.onStateChange((newState) => {
+  if (newState === 'shuttingDown') {
+    io.emit('reconnect-required');
+    io.close();
+  }
+});
+```
+
+## License
+
+ISC
+
+## Recent Improvements
+
+### Version 1.1.0 (Latest)
+- **Connection Management**: Added `Connection: close` header during shutdown to prevent connection reuse
+- **Robust Error Handling**: All callbacks now use `Promise.allSettled` to ensure execution even if some fail
+- **Better TypeScript Support**: Fixed type issues and exported `Phase` enum for better discoverability
+- **Error Logging**: Errors in callbacks are now properly logged instead of silently swallowed
+
+## Contributing
+
+Issues and pull requests are welcome at [github.com/taxilian/node-k8s-lifecycle](https://github.com/taxilian/node-k8s-lifecycle).
