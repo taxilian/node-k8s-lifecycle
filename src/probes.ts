@@ -1,4 +1,3 @@
-import express = require("express");
 import ServerTracker, { WebServer } from './serverTracker';
 
 export const ReadinessProbeInterval = process.env.READYPROBE_INTERVAL ? parseInt(process.env.READYPROBE_INTERVAL, 10) : 30; // seconds
@@ -89,64 +88,218 @@ async function updatePhase(newPhase: Phase) {
     });
 }
 
-const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+const delay = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
 
-export function getProbeRouter(urls: Partial<typeof HealthCheckURLs> = {}, RouterConstructor = express.Router) {
-  for (const k of keys(urls)) {
-    HealthCheckURLs[k] = urls[k]!;
-  }
-  const probeRouter = RouterConstructor();
+export interface ProbeRequest {
+    query?: any;
+    url?: string;
+}
 
-  if (HealthCheckURLs.test) {
-    probeRouter.get(HealthCheckURLs.test, async (req, res) => {
-        const timeout = req.query.t ? parseInt(req.query.t as string) : 10000;
+export interface ProbeResponse {
+    statusCode?: number;
+    writeHead?: (statusCode: number, headers?: any) => void;
+    write: (chunk: any) => void;
+    end: (chunk?: any) => void;
+    status?: (code: number) => ProbeResponse;
+    send?: (data: any) => void;
+}
+
+export type ProbeHandler = (req: ProbeRequest, res: ProbeResponse) => void | Promise<void>;
+
+// Simple probe check functions that return boolean for easy integration
+export async function isReady(): Promise<boolean> {
+    if (failCase || shutdownRequested) {
+        return false;
+    } else if (!httpTrackers.length) {
+        return false;
+    }
+    
+    const allReadyChecks = await Promise.allSettled(readyChecks.map(fn => fn()));
+    const readyChecksPassed = allReadyChecks.every(result => 
+        result.status === 'fulfilled' && result.value === true
+    );
+
+    const httpStarted = httpTrackers.every(t => t.isListening);
+    if (!readyChecksPassed || !httpStarted) {
+        return false;
+    }
+    
+    if (phase === Phase.Startup) { 
+        await updatePhase(Phase.Running); 
+    }
+    
+    return true;
+}
+
+export function isHealthy(): boolean {
+    return !failCase;
+}
+
+// Detailed probe check functions that return status and message
+export interface ProbeCheckResult {
+    healthy: boolean;
+    message: string;
+    statusCode: number;
+}
+
+export async function checkReadiness(): Promise<ProbeCheckResult> {
+    if (failCase || shutdownRequested) {
+        return { healthy: false, message: "Service is closing", statusCode: 503 };
+    } else if (!httpTrackers.length) {
+        return { healthy: false, message: "Server not ready", statusCode: 503 };
+    }
+    
+    const allReadyChecks = await Promise.allSettled(readyChecks.map(fn => fn()));
+    const readyChecksPassed = allReadyChecks.every(result => 
+        result.status === 'fulfilled' && result.value === true
+    );
+
+    const httpStarted = httpTrackers.every(t => t.isListening);
+    if (!readyChecksPassed) {
+        return { healthy: false, message: "Ready check(s) failed", statusCode: 503 };
+    } else if (!httpStarted) {
+        return { healthy: false, message: "HTTP server not ready", statusCode: 503 };
+    }
+    
+    if (phase === Phase.Startup) { 
+        await updatePhase(Phase.Running); 
+    }
+    
+    return { healthy: true, message: "ready", statusCode: 200 };
+}
+
+export function checkLiveness(): ProbeCheckResult {
+    if (failCase) {
+        return { 
+            healthy: false, 
+            message: `Unrecoverable error: ${failCase.message}`, 
+            statusCode: 503 
+        };
+    }
+    return { healthy: true, message: "alive", statusCode: 200 };
+}
+
+export interface ProbeRouter {
+    get(path: string, handler: ProbeHandler): void;
+    [key: string]: any; // Allow additional properties for Express compatibility
+}
+
+export type RouterFactory = () => ProbeRouter;
+
+function createProbeHandlers() {
+    const testHandler: ProbeHandler = async (req, res) => {
+        const timeout = req.query?.t ? parseInt(req.query.t as string) : 10000;
         res.write(`Waiting for ${timeout} ...\n`);
         await delay(timeout);
-    
         res.write(`Done`);
         res.end();
-    });
-  }
-  
-  probeRouter.get(HealthCheckURLs.ready, async (req, res) => {
-    // console.log("READY check:", failCase, shutdownRequested);
-      try {
-          if (failCase || shutdownRequested) {
-              // As soon as shutdown is requested, start returning invalid for the readiness;
-              // we should also be "unready" any time there is a fail case, which also will
-              // fail liveness
-              return res.status(500).send("Service is closing");
-          } else if (!httpTrackers.length) {
-              // This shouldn't be possible
-              return res.status(500).send("Server not ready");
-          }
-          const allReadyChecks = await Promise.allSettled(readyChecks.map(fn => fn()));
-          const readyChecksPassed = allReadyChecks.every(result => 
-              result.status === 'fulfilled' && result.value === true
-          );
-  
-          const httpStarted = httpTrackers.every(t => t.isListening);
-          if (!readyChecksPassed) {
-              return res.status(500).send("Ready check(s) failed");
-          } else if (!httpStarted) {
-              return res.status(500).send("HTTP server not ready");
-          }
-          if (phase === Phase.Startup) { await updatePhase(Phase.Running); }
-          return res.send("ready");
-      } catch (err: any) {
-          onException("Error in readiness probe: ", err, err?.stack);
-          return res.status(500).send("Unexpected error: " + err?.toString());
-      }
-  });
-  probeRouter.get(HealthCheckURLs.live, (req, res) => {
-      if (failCase) {
-          // There was an unrecoverable error
-          return res.status(500).send(`Unrecoverable error: ${failCase.message}`);
-      }
-      return res.send("alive");
-  });
-  return probeRouter;
+    };
+
+    const readyHandler: ProbeHandler = async (_req, res) => {
+        try {
+            const result = await checkReadiness();
+            sendResponse(res, result.statusCode, result.message);
+        } catch (err: any) {
+            onException("Error in readiness probe: ", err, err?.stack);
+            sendResponse(res, 500, "Unexpected error: " + err?.toString());
+        }
+    };
+
+    const liveHandler: ProbeHandler = (_req, res) => {
+        const result = checkLiveness();
+        sendResponse(res, result.statusCode, result.message);
+    };
+
+    return { testHandler, readyHandler, liveHandler };
 }
+
+function sendResponse(res: ProbeResponse, statusCode: number, message: string) {
+    if (res.status && res.send) {
+        // Express-like response
+        const statusRes = res.status(statusCode);
+        if (statusRes && statusRes.send) {
+            statusRes.send(message);
+        }
+    } else if (res.writeHead) {
+        // Node.js raw response
+        res.writeHead(statusCode, { 'Content-Type': 'text/plain' });
+        res.end(message);
+    } else {
+        // Fallback
+        res.statusCode = statusCode;
+        res.end(message);
+    }
+}
+
+// Try to get Express Router if available
+function getExpressRouter(): RouterFactory | null {
+    try {
+        const express = require('express');
+        return express.Router;
+    } catch (e) {
+        return null;
+    }
+}
+
+export function getProbeRouter(urls: Partial<typeof HealthCheckURLs> = {}, RouterFactoryOrConstructor?: RouterFactory | any): any {
+    for (const k of keys(urls)) {
+        HealthCheckURLs[k] = urls[k]!;
+    }
+    
+    let routerFactory: RouterFactory;
+    
+    if (!RouterFactoryOrConstructor) {
+        // No factory provided, try to auto-detect Express
+        const expressRouter = getExpressRouter();
+        if (!expressRouter) {
+            throw new Error('No router factory provided and Express is not installed. Please install express or provide a router factory function.');
+        }
+        routerFactory = expressRouter;
+    } else if (typeof RouterFactoryOrConstructor === 'function') {
+        // It's either a factory function or a constructor
+        routerFactory = RouterFactoryOrConstructor;
+    } else {
+        throw new Error('RouterFactoryOrConstructor must be a function');
+    }
+    
+    const probeRouter = routerFactory();
+    const { testHandler, readyHandler, liveHandler } = createProbeHandlers();
+    
+    if (HealthCheckURLs.test) {
+        probeRouter.get(HealthCheckURLs.test, testHandler);
+    }
+    probeRouter.get(HealthCheckURLs.ready, readyHandler);
+    probeRouter.get(HealthCheckURLs.live, liveHandler);
+    
+    return probeRouter;
+}
+
+
+
+// Generic handlers that work with any framework supporting async route handlers
+export const probeHandlers = {
+    // Returns the check result - framework can decide how to handle it
+    readiness: async (): Promise<ProbeCheckResult> => {
+        return await checkReadiness();
+    },
+    
+    liveness: (): ProbeCheckResult => {
+        return checkLiveness();
+    },
+    
+    // Combined health check
+    health: async (): Promise<{ ready: boolean; healthy: boolean; status: string }> => {
+        const ready = await isReady();
+        const healthy = isHealthy();
+        return {
+            ready,
+            healthy,
+            status: ready && healthy ? 'ok' : 'degraded'
+        };
+    }
+};
+
+
 
 export async function startShutdown() {
     // if (isDev) {
@@ -264,5 +417,4 @@ function forceShutdown(code?: number | string | null) {
     console.log("Failed to shut down gracefully, shutting down hard now");
     // If we hit this, dump out what was still keeping the process alive
     process.exit(code);
-    process.abort();
 }

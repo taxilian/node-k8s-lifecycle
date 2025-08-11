@@ -50,7 +50,7 @@ describe('Probes Module', () => {
         
         const res = await app.router.simulateRequest('GET', '/api/probe/ready');
         
-        expect(res.statusCode).toBe(500);
+        expect(res.statusCode).toBe(503);
         expect(res.body).toBe('Ready check(s) failed');
       });
       
@@ -64,7 +64,7 @@ describe('Probes Module', () => {
         
         const res = await app.router.simulateRequest('GET', '/api/probe/ready');
         
-        expect(res.statusCode).toBe(500);
+        expect(res.statusCode).toBe(503);
         expect(res.body).toBe('HTTP server not ready');
       });
       
@@ -81,7 +81,7 @@ describe('Probes Module', () => {
         
         const res = await app.router.simulateRequest('GET', '/api/probe/ready');
         
-        expect(res.statusCode).toBe(500);
+        expect(res.statusCode).toBe(503);
         expect(res.body).toBe('Service is closing');
       });
       
@@ -99,7 +99,7 @@ describe('Probes Module', () => {
         
         const res = await app.router.simulateRequest('GET', '/api/probe/ready');
         
-        expect(res.statusCode).toBe(500);
+        expect(res.statusCode).toBe(503);
         expect(res.body).toBe('Ready check(s) failed');
       });
       
@@ -119,7 +119,7 @@ describe('Probes Module', () => {
         const res = await app.router.simulateRequest('GET', '/api/probe/ready');
         
         // Behavioral outcome: probe fails if ANY check fails
-        expect(res.statusCode).toBe(500);
+        expect(res.statusCode).toBe(503);
         expect(res.body).toBe('Ready check(s) failed');
       });
     });
@@ -145,7 +145,7 @@ describe('Probes Module', () => {
         
         const res = await app.router.simulateRequest('GET', '/api/probe/live');
         
-        expect(res.statusCode).toBe(500);
+        expect(res.statusCode).toBe(503);
         expect(res.body).toBe('Unrecoverable error: Database permanently down');
       });
     });
@@ -471,7 +471,7 @@ describe('Probes Module', () => {
       
       const res = await app.router.simulateRequest('GET', '/api/probe/ready');
       
-      expect(res.statusCode).toBe(500);
+      expect(res.statusCode).toBe(503);
       expect(res.body).toBe('Ready check(s) failed');
     });
     

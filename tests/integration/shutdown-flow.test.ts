@@ -53,7 +53,7 @@ describe('Three-Phase Shutdown Integration', () => {
       
       // Phase 1: Readiness should fail immediately
       const readyRes = await app.router.simulateRequest('GET', '/api/probe/ready');
-      expect(readyRes.statusCode).toBe(500);
+      expect(readyRes.statusCode).toBe(503);
       expect(phases).toContain(K8sLifecycle.Phase.Phase1);
       
       // Phase 2: After 1.5 * interval
@@ -203,7 +203,7 @@ describe('Three-Phase Shutdown Integration', () => {
       
       // Should not be ready if any server is not listening
       const readyRes = await app.router.simulateRequest('GET', '/api/probe/ready');
-      expect(readyRes.statusCode).toBe(500);
+      expect(readyRes.statusCode).toBe(503);
       expect(readyRes.body).toBe('HTTP server not ready');
       
       // Make both ready
@@ -298,7 +298,7 @@ describe('Three-Phase Shutdown Integration', () => {
       
       // Readiness should fail immediately
       const readyRes = await app.router.simulateRequest('GET', '/api/probe/ready');
-      expect(readyRes.statusCode).toBe(500);
+      expect(readyRes.statusCode).toBe(503);
       
       // Wait for Phase 2
       await jest.advanceTimersByTimeAsync(PHASE_1_DURATION);

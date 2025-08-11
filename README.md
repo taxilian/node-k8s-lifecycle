@@ -8,7 +8,7 @@ A TypeScript/Node.js library that helps implement Kubernetes lifecycle managemen
 npm install k8s-lifecycle
 ```
 
-Note: This library requires Express as a peer dependency (version 3.0.0 or higher).
+Note: Express is an optional peer dependency. The library will auto-detect and use Express if available, but you can also use it with Fastify or other frameworks.
 
 ## Why Use This Library?
 
@@ -21,40 +21,158 @@ Kubernetes lifecycle events appear simple at first, but implementing them correc
 
 ## Quick Start
 
-```typescript
-import * as K8sLifecycle from 'k8s-lifecycle';
-import express from 'express';
-import http from 'http';
+### Using with Express
+
+```javascript
+const express = require('express');
+const http = require('http');
+const { 
+    getProbeRouter,
+    addHttpServer,
+    onShutdown,
+    onReadyCheck
+} = require('k8s-lifecycle');
 
 const app = express();
 
 // Add the probe endpoints to your Express app
-const probeRouter = K8sLifecycle.getProbeRouter({
-  test: '/api/probe/test',   // Optional test endpoint
-  ready: '/api/probe/ready',  // Readiness probe endpoint
-  live: '/api/probe/live',    // Liveness probe endpoint
+const probeRouter = getProbeRouter({
+    test: '/health/test',   // Optional test endpoint
+    ready: '/health/ready',  // Readiness probe endpoint
+    live: '/health/live',    // Liveness probe endpoint
 });
 
 app.use(probeRouter);
 
-// Create your server and register it with k8s-lifecycle
-const server = http.createServer(app);
-K8sLifecycle.add(server);
-
 // Add custom readiness checks (optional)
-K8sLifecycle.onReadyCheck(async () => {
-  // Return true if your app is ready to receive traffic
-  return isDatabaseConnected && isRedisReady;
+onReadyCheck(async () => {
+    // Return true if your app is ready to receive traffic
+    return isDatabaseConnected && isRedisReady;
 });
 
 // Add cleanup handlers for graceful shutdown
-K8sLifecycle.onShutdown(async () => {
-  await mongoose.disconnect();
-  await redisClient.quit();
-  clearInterval(backgroundJobInterval);
+onShutdown(async () => {
+    await mongoose.disconnect();
+    await redisClient.quit();
+    clearInterval(backgroundJobInterval);
 });
 
-server.listen(3000);
+// Create your server and register it with k8s-lifecycle
+const server = http.createServer(app);
+addHttpServer(server);
+
+server.listen(3000, () => {
+    console.log('Server listening on port 3000');
+});
+```
+
+### Using with Fastify
+
+```javascript
+const fastify = require('fastify')({ logger: true });
+const { 
+    addHttpServer,
+    onShutdown,
+    onReadyCheck,
+    isReady,      // Simple boolean check
+    isHealthy     // Simple boolean check
+} = require('k8s-lifecycle');
+
+// Use the simple check functions with Fastify routes
+fastify.get('/health/ready', async () => {
+    const ready = await isReady();
+    if (!ready) {
+        throw { statusCode: 503, message: 'Service not ready' };
+    }
+    return { status: 'ready' };
+});
+
+fastify.get('/health/live', async () => {
+    const healthy = isHealthy();
+    if (!healthy) {
+        throw { statusCode: 503, message: 'Service unhealthy' };
+    }
+    return { status: 'healthy' };
+});
+
+// Add custom readiness checks
+onReadyCheck(async () => {
+    return isDatabaseConnected;
+});
+
+// Register shutdown handler
+onShutdown(async () => {
+    await fastify.close();
+});
+
+// Start and register server
+fastify.listen({ port: 3000, host: '0.0.0.0' }, (err) => {
+    if (err) process.exit(1);
+    addHttpServer(fastify.server);
+});
+```
+
+### Using with Any Framework
+
+The library provides simple check functions that work with any framework:
+
+```javascript
+const { isReady, isHealthy, checkReadiness, checkLiveness } = require('k8s-lifecycle');
+
+// Simple boolean checks
+app.get('/health', async (req, res) => {
+    const ready = await isReady();
+    const healthy = isHealthy();
+    
+    if (ready && healthy) {
+        res.status(200).json({ status: 'ok' });
+    } else {
+        res.status(503).json({ status: 'degraded', ready, healthy });
+    }
+});
+
+// Or use detailed check results
+app.get('/ready', async (req, res) => {
+    const result = await checkReadiness();
+    res.status(result.statusCode).send(result.message);
+});
+```
+
+## Running the Examples
+
+The repository includes complete working examples:
+
+```bash
+# Express with traditional router approach
+node examples/express-example.js
+
+# Express with generic handlers (simpler)
+node examples/express-simple.js
+
+# Fastify example
+node examples/fastify-example.js
+
+# Fastify with simple boolean checks
+node examples/fastify-native-simple.js
+```
+
+All examples demonstrate:
+- Setting up health check endpoints
+- Custom readiness checks
+- Graceful shutdown handlers
+- Simulated database connections
+- Error handling
+
+Test the health endpoints:
+```bash
+# Readiness check
+curl http://localhost:3000/health/ready
+
+# Liveness check
+curl http://localhost:3000/health/live
+
+# Combined health check (Fastify native example)
+curl http://localhost:3002/health
 ```
 
 ## How It Works
@@ -98,10 +216,42 @@ The library uses `Promise.allSettled` for all callback arrays, ensuring that:
 
 ## API Reference
 
-### Core Functions
+### Probe Check Functions
 
-#### `getProbeRouter(urls?, RouterConstructor?)`
-Creates an Express router with health check endpoints.
+#### `isReady(): Promise<boolean>`
+Simple boolean check for readiness. Returns `true` if the service is ready to accept traffic.
+
+```typescript
+const ready = await isReady();
+```
+
+#### `isHealthy(): boolean`
+Simple boolean check for liveness. Returns `true` if the service is healthy.
+
+```typescript
+const healthy = isHealthy();
+```
+
+#### `checkReadiness(): Promise<ProbeCheckResult>`
+Detailed readiness check with status code and message.
+
+```typescript
+const result = await checkReadiness();
+// result = { healthy: true, message: 'ready', statusCode: 200 }
+```
+
+#### `checkLiveness(): ProbeCheckResult`
+Detailed liveness check with status code and message.
+
+```typescript
+const result = checkLiveness();
+// result = { healthy: true, message: 'alive', statusCode: 200 }
+```
+
+### Express Integration
+
+#### `getProbeRouter(urls?, RouterFactoryOrConstructor?)`
+Creates a router with health check endpoints. Auto-detects Express if no factory is provided.
 
 ```typescript
 const probeRouter = K8sLifecycle.getProbeRouter({
@@ -111,11 +261,37 @@ const probeRouter = K8sLifecycle.getProbeRouter({
 });
 ```
 
-#### `add(server)`
+### Generic Handlers
+
+#### `probeHandlers`
+Framework-agnostic handlers that return check results.
+
+```typescript
+// Express example
+app.get('/health', async (req, res) => {
+    const result = await probeHandlers.readiness();
+    res.status(result.statusCode).send(result.message);
+});
+
+// Fastify example
+fastify.get('/health', async (request, reply) => {
+    const result = await probeHandlers.readiness();
+    reply.code(result.statusCode).send(result.message);
+});
+
+// Available handlers:
+probeHandlers.readiness() // Returns ProbeCheckResult
+probeHandlers.liveness()  // Returns ProbeCheckResult
+probeHandlers.health()     // Returns combined health status
+```
+
+### Core Functions
+
+#### `addHttpServer(server)`
 Registers an HTTP/HTTPS server for lifecycle management.
 
 ```typescript
-K8sLifecycle.add(server);
+K8sLifecycle.addHttpServer(server);
 ```
 
 #### `onReadyCheck(fn)`
