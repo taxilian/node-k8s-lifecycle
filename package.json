@@ -1,6 +1,6 @@
 {
   "name": "k8s-lifecycle",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A tool to assist with correctly implementing kubernetes startup, health, and readiness checks",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
